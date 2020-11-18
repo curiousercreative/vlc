@@ -408,8 +408,9 @@ int DBMSDIOutput::ConfigureVideo(const video_format_t *vfmt)
         result = p_output->DoesSupportVideoMode(vconn,
                                                 mode_id,
                                                 pixelFormat,
+                                                bmdNoVideoOutputConversion,
                                                 bmdSupportedVideoModeDefault,
-                                                NULL,
+                                                &mode_id,
                                                 &supported);
 #endif
         CHECK("Does not support video mode");

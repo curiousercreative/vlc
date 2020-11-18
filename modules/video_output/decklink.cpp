@@ -543,8 +543,9 @@ static int OpenDecklink(vout_display_t *vd, decklink_sys_t *sys, video_format_t 
         result = sys->p_output->DoesSupportVideoMode(vconn,
                                                 mode_id,
                                                 pixelFormat,
+                                                bmdNoVideoOutputConversion,
                                                 bmdSupportedVideoModeDefault,
-                                                NULL,
+                                                &mode_id,
                                                 &supported);
 #endif
         CHECK("Does not support video mode");
