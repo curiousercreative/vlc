@@ -62,7 +62,6 @@
 #define FRAME_SIZE 1920
 #define CHANNELS_MAX 6
 
-#if 0
 static const int pi_channels_maps[CHANNELS_MAX+1] =
 {
     0,
@@ -73,7 +72,6 @@ static const int pi_channels_maps[CHANNELS_MAX+1] =
     AOUT_CHANS_5_0,
     AOUT_CHANS_5_1,
 };
-#endif
 
 #define NOSIGNAL_INDEX_TEXT N_("Timelength after which we assume there is no signal.")
 #define NOSIGNAL_INDEX_LONGTEXT N_(\
@@ -207,7 +205,7 @@ struct decklink_sys_t
     bool    b_videomodule;
     bool    b_recycling;
 
-    //int i_channels;
+    int i_channels;
     int i_rate;
 
     BMDTimeScale timescale;
@@ -328,8 +326,9 @@ static decklink_sys_t *HoldDLSys(vlc_object_t *obj, int i_cat)
             sys->b_videomodule = (i_cat == VIDEO_ES);
             sys->b_recycling = false;
             sys->i_rate = var_InheritInteger(obj, AUDIO_CFG_PREFIX "audio-rate");
-            if(sys->i_rate > 0)
-                sys->i_rate = -1;
+            sys->i_channels = var_InheritInteger(obj, AUDIO_CFG_PREFIX "audio-channels");
+            // if(sys->i_rate > 0)
+            //     sys->i_rate = -1;
             vlc_mutex_init(&sys->lock);
             vlc_cond_init(&sys->cond);
             var_Create(libvlc, "decklink-sys", VLC_VAR_ADDRESS);
@@ -569,8 +568,15 @@ static int OpenDecklink(vout_display_t *vd, decklink_sys_t *sys, video_format_t 
         CHECK("Could not enable video output");
 
         video_format_Copy(fmt, vd->source);
-        fmt->i_width = fmt->i_visible_width = p_display_mode->GetWidth();
-        fmt->i_height = fmt->i_visible_height = p_display_mode->GetHeight();
+        const float src_ar = fmt->i_visible_width / fmt->i_visible_height;
+        const float display_ar = p_display_mode->GetWidth() / p_display_mode->GetHeight();
+        const int scale_factor = display_ar > src_ar
+          ? p_display_mode->GetHeight() / fmt->i_visible_height
+          : p_display_mode->GetWidth() / fmt->i_visible_width;
+        fmt->i_visible_width = fmt->i_visible_width * scale_factor;
+        fmt->i_visible_height = fmt->i_visible_height * scale_factor;
+        fmt->i_width = p_display_mode->GetWidth();
+        fmt->i_height = p_display_mode->GetHeight();
         fmt->i_x_offset = 0;
         fmt->i_y_offset = 0;
         fmt->i_sar_num = 0;
@@ -580,12 +586,12 @@ static int OpenDecklink(vout_display_t *vd, decklink_sys_t *sys, video_format_t 
         fmt->i_frame_rate_base = (unsigned) sys->timescale;
     }
 
-    if (/*decklink_sys->i_channels > 0 &&*/ sys->i_rate > 0)
+    if (sys->i_channels > 0 && sys->i_rate > 0)
     {
         result = sys->p_output->EnableAudioOutput(
             sys->i_rate,
             bmdAudioSampleType16bitInteger,
-            /*decklink_sys->i_channels*/ 2,
+            sys->i_channels,
             bmdAudioOutputStreamTimestamped);
         CHECK("Could not start audio output");
     }
@@ -671,6 +677,68 @@ static void PrepareVideo(vout_display_t *vd, picture_t *picture, subpicture_t *,
     w = vd->fmt->i_width;
     h = vd->fmt->i_height;
 
+    const int padY = (vd->fmt->i_height - vd->fmt->i_visible_height) / 2;
+    const int pitch = picture->p[0].i_pitch;
+    // struct blank_format_t {
+    //   int i_width;
+    //   int i_height;
+    // };
+    // struct blank_picture_t {
+    //   blank_format_t blank_format;
+    //   int i_planes;
+    //   plane_t p[3];
+    // };
+    //
+    // struct plane_t blank_p0 = {
+    //   NULL,
+    //   padY,
+    //   picture->p[0].i_pitch,
+    // };
+    // struct plane_t blank_p1 = {
+    //   NULL,
+    //   padY,
+    //   picture->p[1].i_pitch,
+    // };
+    // struct plane_t blank_p2 = {
+    //   NULL,
+    //   padY,
+    //   picture->p[2].i_pitch,
+    // };
+    // plane_t blank_p[3] = {
+    //   blank_p0,
+    //   blank_p1,
+    //   blank_p2,
+    // };
+    //
+    // blank_picture_t blank_picture = {
+    //   { w, padY },
+    //   picture->i_planes,
+    // };
+    // blank_picture.p = {
+    //   blank_p0,
+    //   blank_p1,
+    //   blank_p2,
+    // };
+
+    picture_t blank_picture;
+    video_frame_format_t blank_format;
+    plane_t blank_plane0;
+    plane_t blank_plane1;
+    plane_t blank_plane2;
+    blank_format.i_width = w;
+    blank_format.i_height = padY;
+    blank_plane0.i_lines = padY;
+    blank_plane0.i_pitch = picture->p[0].i_pitch;
+    blank_plane1.i_lines = padY / 2;
+    blank_plane1.i_pitch = picture->p[1].i_pitch;
+    blank_plane2.i_lines = padY / 2;
+    blank_plane2.i_pitch = picture->p[2].i_pitch;
+    blank_picture.format = blank_format;
+    blank_picture.i_planes = picture->i_planes;
+    blank_picture.p[0] = blank_plane0;
+    blank_picture.p[1] = blank_plane1;
+    blank_picture.p[2] = blank_plane2;
+
     IDeckLinkMutableVideoFrame *pDLVideoFrame;
     result = sys->p_output->CreateVideoFrame(w, h, w*3,
         sys->video.tenbits ? bmdFormat10BitYUV : bmdFormat8BitYUV,
@@ -708,6 +776,17 @@ static void PrepareVideo(vout_display_t *vd, picture_t *picture, subpicture_t *,
         sdi::AFD afd(sys->video.afd, sys->video.ar);
         afd.FillBuffer(reinterpret_cast<uint8_t*>(buf), stride);
 
+        // TODO: write black pixels to frame_bytes for padding before and after next line rest of this
+        // plane_t y = blank_picture.p[0];
+        // memset(y.p_pixels, 0x0, y.i_lines * y.i_pitch);
+        // for (int i = 1; i < blank_picture.i_planes; i++) {
+        //     plane_t p = blank_picture.p[i];
+        //     size_t len = p.i_lines * p.i_pitch / 2;
+        //     int16_t *data = (int16_t*)p.p_pixels;
+        //     for (size_t j = 0; j < len; j++) // XXX: SIMD
+        //         data[j] = 0x200;
+        // }
+        // sdi::V210::Convert(&blank_picture, stride, frame_bytes);
         sdi::V210::Convert(picture, stride, frame_bytes);
 
         result = pDLVideoFrame->SetAncillaryData(vanc);
@@ -868,8 +947,8 @@ static int Start(audio_output_t *aout, audio_sample_format_t *restrict fmt)
         return VLC_EGENERIC;
 
     fmt->i_format = VLC_CODEC_S16N;
-    fmt->i_channels = 2; //decklink_sys->i_channels;
-    fmt->i_physical_channels = AOUT_CHANS_STEREO; //pi_channels_maps[fmt->i_channels];
+    fmt->i_channels = sys->i_channels;
+    fmt->i_physical_channels = pi_channels_maps[fmt->i_channels];
     fmt->channel_type = AUDIO_CHANNEL_TYPE_BITMAP;
     fmt->i_rate = sys->i_rate;
     fmt->i_bitspersample = 16;
@@ -878,6 +957,8 @@ static int Start(audio_output_t *aout, audio_sample_format_t *restrict fmt)
 
     return VLC_SUCCESS;
 }
+
+static void Stop (audio_output_t *aout) {}
 
 static void PlayAudio(audio_output_t *aout, block_t *audio, vlc_tick_t systempts)
 {
@@ -891,7 +972,7 @@ static void PlayAudio(audio_output_t *aout, block_t *audio, vlc_tick_t systempts
         return;
     }
 
-    uint32_t sampleFrameCount = audio->i_buffer / (2 * 2 /*decklink_sys->i_channels*/);
+    uint32_t sampleFrameCount = audio->i_buffer / (2 * sys->i_channels);
     uint32_t written;
     HRESULT result = p_output->ScheduleAudioSamples(
             audio->p_buffer, sampleFrameCount, systempts, CLOCK_FREQ, &written);
@@ -914,7 +995,7 @@ static int OpenAudio(vlc_object_t *p_this)
     aout->sys = sys;
 
     vlc_mutex_lock(&sys->lock);
-    //decklink_sys->i_channels = var_InheritInteger(vd, AUDIO_CFG_PREFIX "audio-channels");
+    sys->i_channels = var_InheritInteger(aout, AUDIO_CFG_PREFIX "audio-channels");
     sys->i_rate = var_InheritInteger(aout, AUDIO_CFG_PREFIX "audio-rate");
     vlc_cond_signal(&sys->cond);
     vlc_mutex_unlock(&sys->lock);
@@ -926,7 +1007,7 @@ static int OpenAudio(vlc_object_t *p_this)
     aout->time_get  = TimeGet;
 
     aout->pause     = aout_PauseDefault;
-    aout->stop      = NULL;
+    aout->stop      = Stop;
     aout->mute_set  = NULL;
     aout->volume_set= NULL;
 
