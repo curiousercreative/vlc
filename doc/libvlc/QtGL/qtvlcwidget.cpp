@@ -117,6 +117,9 @@ public:
     static void cleanup(void* data)
     {
         VLCVideo* that = static_cast<VLCVideo*>(data);
+
+        that->videoReady.release();
+
         if (that->m_width == 0 && that->m_height == 0)
             return;
         delete that->mBuffers[0];
@@ -194,7 +197,7 @@ QtVLCWidget::QtVLCWidget(QWidget *parent)
     // support it, the widget will become transparent apart from the logo.
 
     const char *args[] = {
-        "--verbose=4"
+        "--verbose=2"
     };
     m_vlc = libvlc_new(sizeof(args) / sizeof(*args), args);
 

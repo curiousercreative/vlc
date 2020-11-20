@@ -106,9 +106,8 @@ static void InputGetExtraFiles( input_thread_t *p_input,
                                 int *pi_list, char ***pppsz_list,
                                 const char **psz_access, const char *psz_path );
 
-static void AppendAttachment( int *pi_attachment, input_attachment_t ***ppp_attachment,
-                              const demux_t ***ppp_attachment_demux,
-                              int i_new, input_attachment_t **pp_new, const demux_t *p_demux );
+static void AppendAttachment(input_thread_t* p_input,
+                              int i_new, input_attachment_t **pp_new);
 
 #define SLAVE_ADD_NOFLAG    0
 #define SLAVE_ADD_FORCED    (1<<0)
@@ -316,7 +315,6 @@ static input_thread_t *Create( vlc_object_t *p_parent,
     priv->rate = 1.f;
     priv->normal_time = VLC_TICK_0;
     TAB_INIT( priv->i_attachment, priv->attachment );
-    priv->attachment_demux = NULL;
     priv->p_sout   = NULL;
     priv->b_out_pace_control = priv->b_thumbnailing;
     priv->p_renderer = p_renderer && priv->b_preparsing == false ?
@@ -1151,7 +1149,7 @@ static void LoadSlaves( input_thread_t *p_input )
             free( psz_mrl );
             /* Don't update item slaves for attachements */
         }
-        vlc_input_attachment_Delete( a );
+        vlc_input_attachment_Release( a );
     }
     free( pp_attachment );
     if( i_attachment > 0 )
@@ -1416,10 +1414,8 @@ static void End( input_thread_t * p_input )
     if( priv->i_attachment > 0 )
     {
         for( int i = 0; i < priv->i_attachment; i++ )
-            vlc_input_attachment_Delete( priv->attachment[i] );
+            vlc_input_attachment_Release( priv->attachment[i] );
         TAB_CLEAN( priv->i_attachment, priv->attachment );
-        free( priv->attachment_demux);
-        priv->attachment_demux = NULL;
     }
 
     vlc_mutex_unlock( &input_priv(p_input)->p_item->lock );
@@ -2779,8 +2775,7 @@ static int InputSourceInit( input_source_t *in, input_thread_t *p_input,
                          &attachment, &i_attachment ) )
     {
         vlc_mutex_lock( &input_priv(p_input)->p_item->lock );
-        AppendAttachment( &input_priv(p_input)->i_attachment, &input_priv(p_input)->attachment, &input_priv(p_input)->attachment_demux,
-                          i_attachment, attachment, in->p_demux );
+        AppendAttachment( p_input, i_attachment, attachment );
         vlc_mutex_unlock( &input_priv(p_input)->p_item->lock );
     }
 
@@ -2896,8 +2891,8 @@ static void InputSourceMeta( input_thread_t *p_input,
         if( p_demux_meta->i_attachments > 0 )
         {
             vlc_mutex_lock( &input_priv(p_input)->p_item->lock );
-            AppendAttachment( &input_priv(p_input)->i_attachment, &input_priv(p_input)->attachment, &input_priv(p_input)->attachment_demux,
-                              p_demux_meta->i_attachments, p_demux_meta->attachments, p_demux);
+            AppendAttachment( p_input, p_demux_meta->i_attachments,
+                              p_demux_meta->attachments );
             vlc_mutex_unlock( &input_priv(p_input)->p_item->lock );
         }
         module_unneed( p_demux, p_id3 );
@@ -3033,43 +3028,39 @@ static void InputMetaUser( input_thread_t *p_input, vlc_meta_t *p_meta )
     }
 }
 
-static void AppendAttachment( int *pi_attachment, input_attachment_t ***ppp_attachment,
-                              const demux_t ***ppp_attachment_demux,
-                              int i_new, input_attachment_t **pp_new, const demux_t *p_demux )
+static void AppendAttachment( input_thread_t *p_input, int i_new,
+                              input_attachment_t **pp_new )
 {
-    int i_attachment = *pi_attachment;
+    input_thread_private_t *priv = input_priv( p_input );
+    int i_attachment = priv->i_attachment;
     int i;
 
     if ( i_attachment + i_new == 0 )
         /* nothing to do */
         return;
 
-    input_attachment_t **pp_att = realloc( *ppp_attachment,
+    input_attachment_t **pp_att = realloc( priv->attachment,
                     sizeof(*pp_att) * ( i_attachment + i_new ) );
     if( likely(pp_att) )
     {
-        *ppp_attachment = pp_att;
-        const demux_t **pp_attdmx = realloc( *ppp_attachment_demux,
-                        sizeof(*pp_attdmx) * ( i_attachment + i_new ) );
-        if( likely(pp_attdmx) )
+        priv->attachment = pp_att;
+        for( i = 0; i < i_new; i++ )
         {
-            *ppp_attachment_demux = pp_attdmx;
-
-            for( i = 0; i < i_new; i++ )
-            {
-                pp_att[i_attachment] = pp_new[i];
-                pp_attdmx[i_attachment++] = p_demux;
-            }
-            /* */
-            *pi_attachment = i_attachment;
-            free( pp_new );
-            return;
+            pp_att[i_attachment++] = pp_new[i];
         }
+        /* */
+        priv->i_attachment = i_attachment;
+        vlc_event_send( &priv->p_item->event_manager, &(vlc_event_t) {
+            .type = vlc_InputItemAttachmentsFound,
+            .u.input_item_attachments_found.attachments = pp_new,
+            .u.input_item_attachments_found.count = i_new } );
+        free( pp_new );
+        return;
     }
 
     /* on alloc errors */
     for( i = 0; i < i_new; i++ )
-        vlc_input_attachment_Delete( pp_new[i] );
+        vlc_input_attachment_Release( pp_new[i] );
     free( pp_new );
 }
 
@@ -3093,26 +3084,26 @@ static void InputUpdateMeta( input_thread_t *p_input, demux_t *p_demux )
     if( !demux_Control( p_demux, DEMUX_GET_ATTACHMENTS,
                         &attachment, &i_attachment ) )
     {
-        vlc_mutex_lock( &input_priv(p_input)->p_item->lock );
-        if( input_priv(p_input)->i_attachment > 0 )
+        input_thread_private_t *priv = input_priv(p_input);
+        vlc_mutex_lock( &priv->p_item->lock );
+        int nb_new = 0;
+        for ( int i = 0; i < i_attachment; ++i )
         {
-            int j = 0;
-            for( int i = 0; i < input_priv(p_input)->i_attachment; i++ )
+            bool is_new = true;
+            for( int j = 0; j < priv->i_attachment; ++j )
             {
-                if( input_priv(p_input)->attachment_demux[i] == p_demux )
-                    vlc_input_attachment_Delete( input_priv(p_input)->attachment[i] );
-                else
+                if( priv->attachment[j] == attachment[i] )
                 {
-                    input_priv(p_input)->attachment[j] = input_priv(p_input)->attachment[i];
-                    input_priv(p_input)->attachment_demux[j] = input_priv(p_input)->attachment_demux[i];
-                    j++;
+                    vlc_input_attachment_Release( attachment[i] );
+                    is_new = false;
+                    break;
                 }
             }
-            input_priv(p_input)->i_attachment = j;
+            if( is_new )
+                attachment[nb_new++] = attachment[i];
         }
-        AppendAttachment( &input_priv(p_input)->i_attachment, &input_priv(p_input)->attachment, &input_priv(p_input)->attachment_demux,
-                          i_attachment, attachment, p_demux );
-        vlc_mutex_unlock( &input_priv(p_input)->p_item->lock );
+        AppendAttachment( p_input, nb_new, attachment );
+        vlc_mutex_unlock( &priv->p_item->lock );
     }
 
     es_out_ControlSetMeta( input_priv(p_input)->p_es_out, p_meta );
@@ -3487,10 +3478,13 @@ int input_GetAttachments(input_thread_t *input,
 
     *attachments = vlc_alloc(attachments_count, sizeof(input_attachment_t*));
     if (!*attachments)
+    {
+        vlc_mutex_unlock(&priv->p_item->lock);
         return -1;
+    }
 
     for (int i = 0; i < attachments_count; i++)
-        (*attachments)[i] = vlc_input_attachment_Duplicate(priv->attachment[i]);
+        (*attachments)[i] = vlc_input_attachment_Hold(priv->attachment[i]);
 
     vlc_mutex_unlock(&priv->p_item->lock);
     return attachments_count;
@@ -3506,7 +3500,7 @@ input_attachment_t *input_GetAttachment(input_thread_t *input, const char *name)
         if (!strcmp( priv->attachment[i]->psz_name, name))
         {
             input_attachment_t *attachment =
-                vlc_input_attachment_Duplicate(priv->attachment[i] );
+                vlc_input_attachment_Hold(priv->attachment[i] );
             vlc_mutex_unlock( &priv->p_item->lock );
             return attachment;
         }

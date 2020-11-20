@@ -104,7 +104,7 @@ void picture_fifo_Flush(picture_fifo_t *fifo, vlc_tick_t date, bool flush_before
         vlc_picture_chain_GetAndClear(&fifo->pics, &filter_chain);
 
         while ( !vlc_picture_chain_IsEmpty( &filter_chain ) ) {
-            picture_t *picture = vlc_picture_chain_PopFront( &filter_chain );
+            picture = vlc_picture_chain_PopFront( &filter_chain );
 
             if (( flush_before && picture->date <= date) ||
                 (!flush_before && picture->date >= date))
@@ -123,4 +123,3 @@ void picture_fifo_Delete(picture_fifo_t *fifo)
     picture_fifo_Flush(fifo, VLC_TICK_INVALID, true);
     free(fifo);
 }
-
